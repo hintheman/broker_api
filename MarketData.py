@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import re
+import base64
+import json
+import os
+import time
+import urllib.parse
 from dataclasses import dataclass
-from typing import Optional, Literal
+from pathlib import Path
+from typing import Dict, Optional, Literal
 
 import pandas as pd
 import requests
 import yfinance as yf
-from SchwabAuthManager import SchwabAuthManager, SchwabReauthRequired
+from SchwabAuthManager import SchwabAuthManager, SchwabReauthRequired, SchwabAuthError
 
 BROKER_CHOICES = ("schwab", "yfinance")
 BROKER_FALLBACK_CHOICES = ("yfinance", "none")
@@ -41,44 +46,6 @@ SCHWAB_PRICEHISTORY_MAP = {
     "1wk": (1, "weekly", 10, "year"),
 }
 
-YF_MAP = {
-    "NQ": "NQ=F",
-    "MNQ": "MNQ=F",
-    "ES": "ES=F",
-    "MES": "MES=F",
-    "YM": "YM=F",
-    "MYM": "MYM=F",
-    "RTY": "RTY=F",
-    "M2K": "M2K=F",
-    "CL": "CL=F",
-    "MCL": "MCL=F",
-    "GC": "GC=F",
-    "MGC": "MGC=F",
-    "BTC": "BTC=F",
-    "ETH": "ETH=F",
-    "SOL": "SOL=F",
-    "BTC_CRYPTO": "BTC-USD",
-    "ETH_CRYPTO": "ETH-USD",
-    "SOL_CRYPTO": "SOL-USD",
-}
-
-
-def normalize_yahoo_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().upper()
-
-    if s in YF_MAP:
-        return YF_MAP[s]
-
-    if s.startswith("/"):
-        s = s[1:]
-
-    m = re.match(r"^([A-Z]+)[FGHJKMNQUVXZ]\d{1,2}$", s)
-    if m:
-        root = m.group(1)
-        return YF_MAP.get(root, root)
-
-    return YF_MAP.get(s, s)
-
 
 @dataclass
 class MarketDataConfig:
@@ -89,9 +56,8 @@ class MarketDataConfig:
 class YahooMarketDataProvider:
     def fetch_bars(self, symbol: str, interval: str, bars: int = 300) -> Optional[pd.DataFrame]:
         period = PERIOD_MAP.get(interval, "60d")
-        yf_symbol = normalize_yahoo_symbol(symbol)
         try:
-            df = yf.download(yf_symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+            df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
             if df is None or df.empty:
                 return None
             if isinstance(df.columns, pd.MultiIndex):
@@ -118,7 +84,7 @@ class SchwabMarketDataProvider:
     def fetch_quote(self, symbol: str) -> Optional[dict]:
         url = f"{self.base_url}/quotes"
         params = {"symbols": symbol, "fields": "quote"}
-        r = self.auth.request("GET", url, params=params, timeout=self.timeout)
+        r = requests.get(url, headers=self.auth.auth_headers(), params=params, timeout=self.timeout)
         if r.status_code >= 400:
             return None
         data = r.json()
@@ -139,7 +105,7 @@ class SchwabMarketDataProvider:
             "needExtendedHoursData": "false",
             "needPreviousClose": "false",
         }
-        r = self.auth.request("GET", url, params=params, timeout=self.timeout)
+        r = requests.get(url, headers=self.auth.auth_headers(), params=params, timeout=self.timeout)
         if r.status_code >= 400:
             return None
         payload = r.json()
@@ -228,12 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    router = BrokerRouter(
-        primary=args.broker,
-        fallback=args.broker_fallback,
-        env_file=args.schwab_env,
-        token_file=args.schwab_token_env,
-    )
+    router = BrokerRouter(primary=args.broker, fallback=args.broker_fallback, env_file=args.schwab_env, token_file=args.schwab_token_env)
     if args.symbol:
         df = router.fetch_bars(args.symbol, args.interval, args.bars)
         if df is None:
@@ -244,3 +205,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
