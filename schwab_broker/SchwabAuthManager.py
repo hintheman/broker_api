@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,6 +50,8 @@ def save_env_file(path: str | Path, data: Dict[str, object], ordered_keys: Optio
 
 
 class SchwabAuthManager:
+    BASE_DIR = Path(__file__).resolve().parent
+
     AUTH_BASE_URL = "https://api.schwabapi.com/v1/oauth/authorize"
     DEFAULT_TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
     DEFAULT_MARKETDATA_BASE_URL = "https://api.schwabapi.com/marketdata/v1"
@@ -65,15 +66,16 @@ class SchwabAuthManager:
     ]
 
     def __init__(
-            self,
-            env_file: str | Path | None = None,
-            token_file: str | Path | None = None,
-            timeout: int = 30,
-        ):
+        self,
+        env_file: str | Path | None = None,
+        token_file: str | Path | None = None,
+        timeout: int = 30,
+        refresh_leeway_seconds: int = 60,
+    ):
         self.env_file = Path(env_file) if env_file else self.BASE_DIR / "schwab.env"
         self.token_file = Path(token_file) if token_file else self.BASE_DIR / "schwab_token.env"
-
         self.timeout = timeout
+        self.refresh_leeway_seconds = refresh_leeway_seconds
 
         self.client_id = ""
         self.client_secret = ""
@@ -88,11 +90,13 @@ class SchwabAuthManager:
         self.access_token_expires_at = ""
         self.last_refreshed_at = ""
 
+        self.session = requests.Session()
+
         self.reload()
 
         if not self.client_id or not self.client_secret or not self.redirect_uri:
             raise SchwabAuthError(
-                "Missing SCHWAB_CLIENT_ID, SCHWAB_CLIENT_SECRET, or SCHWAB_REDIRECT_URI in schwab.env"
+                f"Missing SCHWAB_CLIENT_ID, SCHWAB_CLIENT_SECRET, or SCHWAB_REDIRECT_URI in {self.env_file}"
             )
 
     def reload(self) -> None:
@@ -142,11 +146,6 @@ class SchwabAuthManager:
         except ValueError:
             return None
 
-    def _basic_auth_header(self) -> Dict[str, str]:
-        raw = f"{self.client_id}:{self.client_secret}".encode()
-        encoded = base64.b64encode(raw).decode()
-        return {"Authorization": f"Basic {encoded}"}
-
     def _write_token_file(self) -> None:
         values = {
             "SCHWAB_ACCESS_TOKEN": self.access_token,
@@ -158,23 +157,24 @@ class SchwabAuthManager:
         }
         save_env_file(self.token_file, values, ordered_keys=self.TOKEN_FILE_KEYS)
 
-    def ensure_valid_token(self) -> str:
+    def _token_expiring(self) -> bool:
+        expiry = self._parse_expiry()
+        if expiry is None:
+            return False
+        return self._utc_now() >= (expiry - timedelta(seconds=self.refresh_leeway_seconds))
+
+    def ensure_valid_token(self, force_refresh: bool = False) -> str:
         self.reload()
 
-        expiry = self._parse_expiry()
-        now = self._utc_now()
-
-        if not self.access_token:
+        if force_refresh or not self.access_token:
             self.refresh_access_token()
             self.reload()
             if not self.access_token:
                 raise SchwabReauthRequired("No Schwab access token available after refresh")
             return self.access_token
 
-        if expiry is None:
-            return self.access_token
-
-        if now >= (expiry - timedelta(seconds=60)):
+        expiry = self._parse_expiry()
+        if expiry is not None and self._token_expiring():
             self.refresh_access_token()
             self.reload()
 
@@ -187,12 +187,12 @@ class SchwabAuthManager:
         self.reload()
 
         if not self.client_id or not self.client_secret:
-            raise SchwabAuthError("Missing SCHWAB_CLIENT_ID or SCHWAB_CLIENT_SECRET in schwab.env")
+            raise SchwabAuthError(f"Missing SCHWAB_CLIENT_ID or SCHWAB_CLIENT_SECRET in {self.env_file}")
 
         if not self.refresh_token:
-            raise SchwabReauthRequired("Missing SCHWAB_REFRESH_TOKEN in schwab_token.env")
+            raise SchwabReauthRequired(f"Missing SCHWAB_REFRESH_TOKEN in {self.token_file}")
 
-        response = requests.post(
+        response = self.session.post(
             self.token_url,
             headers={
                 "Accept": "application/json",
@@ -232,7 +232,12 @@ class SchwabAuthManager:
         return payload
 
     def exchange_authorization_code(self, code: str) -> Dict[str, object]:
-        response = requests.post(
+        if not self.client_id or not self.client_secret or not self.redirect_uri:
+            raise SchwabAuthError(
+                f"Missing SCHWAB_CLIENT_ID, SCHWAB_CLIENT_SECRET, or SCHWAB_REDIRECT_URI in {self.env_file}"
+            )
+
+        response = self.session.post(
             self.token_url,
             headers={
                 "Accept": "application/json",
@@ -279,9 +284,45 @@ class SchwabAuthManager:
 
         return self.exchange_authorization_code(code)
 
-    def auth_headers(self) -> Dict[str, str]:
-        token = self.ensure_valid_token()
+    def auth_headers(self, force_refresh: bool = False) -> Dict[str, str]:
+        token = self.ensure_valid_token(force_refresh=force_refresh)
         return {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        retry_on_auth_failure: bool = True,
+        **kwargs,
+    ) -> requests.Response:
+        timeout = kwargs.pop("timeout", self.timeout)
+        base_headers = dict(kwargs.pop("headers", {}) or {})
+
+        request_headers = dict(base_headers)
+        request_headers.update(self.auth_headers())
+
+        response = self.session.request(
+            method=method.upper(),
+            url=url,
+            headers=request_headers,
+            timeout=timeout,
+            **kwargs,
+        )
+
+        if retry_on_auth_failure and response.status_code in (401, 403):
+            self.refresh_access_token()
+            retry_headers = dict(base_headers)
+            retry_headers.update(self.auth_headers())
+            response = self.session.request(
+                method=method.upper(),
+                url=url,
+                headers=retry_headers,
+                timeout=timeout,
+                **kwargs,
+            )
+
+        return response
