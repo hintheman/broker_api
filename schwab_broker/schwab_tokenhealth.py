@@ -7,15 +7,18 @@ import ssl
 import sys
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
+import requests
 
 from SchwabAuthManager import SchwabAuthManager, SchwabAuthError, SchwabReauthRequired
 
-ALERT_TO = "youremail@gmail.com"
-ALERT_FROM = "youremail@gmail.com"          # Gmail SMTP requires From == authenticated account
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = "youremail@gmail.com"
-SMTP_APP_PASSWORD_ENV_KEY = "SCHWAB_ALERT_SMTP_PASS"   # store in schwab.env
+from dotenv import load_dotenv
+
+ALERT_TO = os.getenv("ALERT_TO")
+ALERT_FROM = os.getenv("ALERT_FROM")          # Gmail SMTP requires From == authenticated account
+SMTP_HOST = os.getenv("SMTP_HOST)"
+SMTP_PORT = os.getenv("SMTP_PORT")
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_APP_PASSWORD_ENV_KEY = os.getenv("SCHWAB_ALERT_SMTP_PASS")   # store in schwab.env
 
 REFRESH_TOKEN_LIFETIME_DAYS = 7
 WARN_WINDOW_DAYS = 2
