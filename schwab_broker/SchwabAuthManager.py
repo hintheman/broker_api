@@ -72,6 +72,9 @@ def normalize_symbol(symbol: str) -> str:
         "MBT": "/MBT",
         "ETH": "/ETH",
         "MET": "/MET",
+        "SPX": "$SPX",
+        "NDX": "$NDX",
+        "VIX": "$VIX",
     }
 
     if s in aliases:
