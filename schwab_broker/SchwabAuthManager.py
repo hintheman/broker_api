@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -47,6 +48,101 @@ def save_env_file(path: str | Path, data: Dict[str, object], ordered_keys: Optio
         lines.append(f"{k}={s}")
 
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+
+    aliases = {
+        "ES": "/ES",
+        "MES": "/MES",
+        "NQ": "/NQ",
+        "MNQ": "/MNQ",
+        "RTY": "/RTY",
+        "M2K": "/M2K",
+        "YM": "/YM",
+        "MYM": "/MYM",
+        "CL": "/CL",
+        "MCL": "/MCL",
+        "GC": "/GC",
+        "MGC": "/MGC",
+        "SI": "/SI",
+        "SIL": "/SIL",
+        "BTC": "/BTC",
+        "MBT": "/MBT",
+        "ETH": "/ETH",
+        "MET": "/MET",
+    }
+
+    if s in aliases:
+        return aliases[s]
+
+    if not s.startswith("/"):
+        s = f"/{s}"
+
+    m = re.match(r"^/([A-Z0-9]+)([FGHJKMNQUVXZ])(\d{1,2})$", s)
+    if m:
+        root, month_code, year_code = m.groups()
+        root = aliases.get(root, f"/{root}").lstrip("/")
+        return f"/{root}{month_code}{year_code}"
+
+    return s
+
+
+def _symbol_root(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    m = re.match(r"^/([A-Z0-9]+?)([FGHJKMNQUVXZ])(\d{1,2})$", s)
+    if m:
+        return f"/{m.group(1)}"
+    return s
+
+
+def get_point_value(symbol: str) -> float:
+    s = _symbol_root(symbol)
+
+    point_values = {
+        "/ES": 50.0,
+        "/MES": 5.0,
+        "/NQ": 20.0,
+        "/MNQ": 2.0,
+        "/RTY": 50.0,
+        "/M2K": 5.0,
+        "/YM": 5.0,
+        "/MYM": 0.50,
+        "/CL": 1000.0,
+        "/MCL": 100.0,
+        "/GC": 100.0,
+        "/MGC": 10.0,
+        "/SI": 5000.0,
+        "/SIL": 1000.0,
+        "/BTC": 5.0,
+        "/MBT": 0.1,
+        "/ETH": 50.0,
+        "/MET": 0.1,
+    }
+
+    return point_values.get(s, 1.0)
+
+
+def get_daily_cap(symbol: str) -> float:
+    s = _symbol_root(symbol)
+
+    daily_caps = {
+        "/MNQ": 1200.0,
+        "/NQ": 2000.0,
+        "/MES": 2000.0,
+        "/ES": 2000.0,
+        "/MBT": 1200.0,
+        "/BTC": 2000.0,
+        "/MET": 1200.0,
+        "/ETH": 20000.0,
+        "/MGC": 1000.0,
+        "/GC": 1800.0,
+        "/MCL": 1000.0,
+        "/CL": 2000.0,
+    }
+
+    return daily_caps.get(s, 1000.0)
 
 
 class SchwabAuthManager:

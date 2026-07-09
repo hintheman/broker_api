@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import json
-import os
-import time
-import urllib.parse
+import logging
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Optional, Literal
+from typing import Optional, Literal
 
 import pandas as pd
 import requests
 import yfinance as yf
-from SchwabAuthManager import SchwabAuthManager, SchwabReauthRequired, SchwabAuthError
+
+from SchwabAuthManager import SchwabAuthManager, SchwabReauthRequired
 
 BROKER_CHOICES = ("schwab", "yfinance")
 BROKER_FALLBACK_CHOICES = ("yfinance", "none")
@@ -36,15 +32,17 @@ PERIOD_MAP = {
 }
 
 SCHWAB_PRICEHISTORY_MAP = {
-    "1m":  (1, "minute", 1, "day"),
-    "5m":  (5, "minute", 5, "day"),
+    "1m": (1, "minute", 1, "day"),
+    "5m": (5, "minute", 5, "day"),
     "10m": (10, "minute", 10, "day"),
     "15m": (15, "minute", 10, "day"),
     "30m": (30, "minute", 10, "day"),
-    "1h":  (60, "minute", 1, "month"),
-    "1d":  (1, "daily", 1, "year"),
+    "1h": (60, "minute", 1, "month"),
+    "1d": (1, "daily", 1, "year"),
     "1wk": (1, "weekly", 10, "year"),
 }
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,18 +55,30 @@ class YahooMarketDataProvider:
     def fetch_bars(self, symbol: str, interval: str, bars: int = 300) -> Optional[pd.DataFrame]:
         period = PERIOD_MAP.get(interval, "60d")
         try:
-            df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
             if df is None or df.empty:
                 return None
+
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0].lower() for c in df.columns]
             else:
                 df.columns = [str(c).lower() for c in df.columns]
+
             if "adj close" in df.columns and "close" not in df.columns:
                 df = df.rename(columns={"adj close": "close"})
+
             df = df[["open", "high", "low", "close", "volume"]].dropna()
+
             if len(df) > 1:
                 df = df.iloc[:-1]
+
             return df.tail(bars)
         except Exception:
             return None
@@ -80,22 +90,77 @@ class SchwabMarketDataProvider:
     def __init__(self, auth: SchwabAuthManager, timeout: int = 20):
         self.auth = auth
         self.timeout = timeout
+        self.session = requests.Session()
+
+    def _request(self, method: str, path: str, *, params: dict | None = None) -> Optional[requests.Response]:
+        url = f"{self.base_url}{path}"
+
+        try:
+            self.auth.ensure_valid_token()
+        except Exception as e:
+            logger.exception("Schwab preflight token refresh failed: %s", e)
+            return None
+
+        try:
+            r = self.session.request(
+                method,
+                url,
+                headers=self.auth.auth_headers(),
+                params=params,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as e:
+            logger.warning("Schwab request transport error path=%s error=%s", path, e)
+            return None
+
+        if r.status_code in (401, 403):
+            logger.warning("Schwab auth failure %s on %s, forcing token refresh", r.status_code, path)
+            try:
+                self.auth.ensure_valid_token(force_refresh=True)
+            except Exception as e:
+                logger.exception("Schwab forced refresh failed after %s on %s: %s", r.status_code, path, e)
+                return None
+
+            try:
+                r = self.session.request(
+                    method,
+                    url,
+                    headers=self.auth.auth_headers(),
+                    params=params,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as e:
+                logger.warning("Schwab retry transport error path=%s error=%s", path, e)
+                return None
+
+        if r.status_code >= 400:
+            body = r.text[:500] if r.text else ""
+            logger.warning("Schwab request failed path=%s status=%s body=%s", path, r.status_code, body)
+            return None
+
+        return r
 
     def fetch_quote(self, symbol: str) -> Optional[dict]:
-        url = f"{self.base_url}/quotes"
         params = {"symbols": symbol, "fields": "quote"}
-        r = requests.get(url, headers=self.auth.auth_headers(), params=params, timeout=self.timeout)
-        if r.status_code >= 400:
+        r = self._request("GET", "/quotes", params=params)
+        if r is None:
             return None
-        data = r.json()
+
+        try:
+            data = r.json()
+        except ValueError:
+            logger.warning("Schwab quotes returned non-JSON for symbol=%s", symbol)
+            return None
+
         return data.get(symbol) or data.get(symbol.upper())
 
     def fetch_bars(self, symbol: str, interval: str, bars: int = 300) -> Optional[pd.DataFrame]:
         spec = SCHWAB_PRICEHISTORY_MAP.get(interval)
         if spec is None:
+            logger.warning("Unsupported Schwab interval=%s symbol=%s", interval, symbol)
             return None
+
         frequency, frequency_type, period, period_type = spec
-        url = f"{self.base_url}/pricehistory"
         params = {
             "symbol": symbol,
             "periodType": period_type,
@@ -105,25 +170,45 @@ class SchwabMarketDataProvider:
             "needExtendedHoursData": "false",
             "needPreviousClose": "false",
         }
-        r = requests.get(url, headers=self.auth.auth_headers(), params=params, timeout=self.timeout)
-        if r.status_code >= 400:
+
+        r = self._request("GET", "/pricehistory", params=params)
+        if r is None:
             return None
-        payload = r.json()
+
+        try:
+            payload = r.json()
+        except ValueError:
+            logger.warning("Schwab pricehistory returned non-JSON for symbol=%s interval=%s", symbol, interval)
+            return None
+
         candles = payload.get("candles") or []
         if not candles:
+            logger.info("Schwab returned no candles for symbol=%s interval=%s", symbol, interval)
             return None
+
         df = pd.DataFrame(candles)
         if df.empty:
             return None
+
         if "datetime" in df.columns:
             df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
             df = df.set_index("datetime")
+
         cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
         if len(cols) < 5:
+            logger.warning(
+                "Schwab missing OHLCV columns symbol=%s interval=%s cols=%s",
+                symbol,
+                interval,
+                list(df.columns),
+            )
             return None
+
         df = df[cols].dropna()
+
         if len(df) > 1:
             df = df.iloc[:-1]
+
         return df.tail(bars)
 
 
@@ -194,7 +279,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    router = BrokerRouter(primary=args.broker, fallback=args.broker_fallback, env_file=args.schwab_env, token_file=args.schwab_token_env)
+    router = BrokerRouter(
+        primary=args.broker,
+        fallback=args.broker_fallback,
+        env_file=args.schwab_env,
+        token_file=args.schwab_token_env,
+    )
+
     if args.symbol:
         df = router.fetch_bars(args.symbol, args.interval, args.bars)
         if df is None:
@@ -205,4 +296,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
