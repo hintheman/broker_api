@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional, Literal
 
@@ -43,6 +44,22 @@ SCHWAB_PRICEHISTORY_MAP = {
 }
 
 logger = logging.getLogger(__name__)
+
+# Known futures root symbols (short form, without "/" prefix or contract suffix).
+_FUTURES_ROOTS = frozenset({
+    "ES", "MES", "NQ", "MNQ", "RTY", "M2K", "YM", "MYM",
+    "CL", "MCL", "GC", "MGC", "SI", "SIL",
+    "BTC", "MBT", "ETH", "MET",
+})
+
+
+def _is_futures_symbol(symbol: str) -> bool:
+    """Return True if symbol is a futures contract (needs extended-hours data)."""
+    s = (symbol or "").strip().upper()
+    if s.startswith("/"):
+        return True
+    root = re.sub(r"[FGHJKMNQUVXZ]\d{1,2}$", "", s) or s
+    return root in _FUTURES_ROOTS
 
 
 @dataclass
@@ -167,7 +184,9 @@ class SchwabMarketDataProvider:
             "period": period,
             "frequencyType": frequency_type,
             "frequency": frequency,
-            "needExtendedHoursData": "false",
+            # Futures trade ~23h/day on Globex — include extended hours so VWAP,
+            # ATR, and channel calculations reflect the full overnight session.
+            "needExtendedHoursData": "true" if _is_futures_symbol(symbol) else "false",
             "needPreviousClose": "false",
         }
 

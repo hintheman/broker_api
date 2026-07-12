@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 import requests
+import os
 
 from SchwabAuthManager import SchwabAuthManager, SchwabAuthError, SchwabReauthRequired
 
@@ -15,10 +16,10 @@ from dotenv import load_dotenv
 
 ALERT_TO = os.getenv("ALERT_TO")
 ALERT_FROM = os.getenv("ALERT_FROM")          # Gmail SMTP requires From == authenticated account
-SMTP_HOST = os.getenv("SMTP_HOST)"
+SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = os.getenv("SMTP_PORT")
 SMTP_USER = os.getenv("SMTP_USER")
-SMTP_APP_PASSWORD_ENV_KEY = os.getenv("SCHWAB_ALERT_SMTP_PASS")   # store in schwab.env
+SMTP_APP_PASSWORD_ENV_KEY = os.getenv("SMTP_APP_PASSWORD_ENV_KEY")   # store in schwab.env
 
 REFRESH_TOKEN_LIFETIME_DAYS = 7
 WARN_WINDOW_DAYS = 2
@@ -41,10 +42,11 @@ def main() -> int:
     mgr = SchwabAuthManager()
     from SchwabAuthManager import load_env_file
     env = load_env_file(mgr.env_file)
-    smtp_password = env.get(SMTP_APP_PASSWORD_ENV_KEY, "")
+    print(SMTP_APP_PASSWORD_ENV_KEY)
+    smtp_password =SMTP_APP_PASSWORD_ENV_KEY
 
     if not smtp_password:
-        print("Missing SCHWAB_ALERT_SMTP_PASS in schwab.env", file=sys.stderr)
+        print("Missing SMTP_APP_PASSWORD_ENV_KEY in schwab.env", file=sys.stderr)
         return 1
 
     warnings = []
