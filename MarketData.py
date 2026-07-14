@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 from dataclasses import dataclass
 from typing import Optional, Literal
 
@@ -44,22 +43,6 @@ SCHWAB_PRICEHISTORY_MAP = {
 }
 
 logger = logging.getLogger(__name__)
-
-# Known futures root symbols (short form, without "/" prefix or contract suffix).
-_FUTURES_ROOTS = frozenset({
-    "ES", "MES", "NQ", "MNQ", "RTY", "M2K", "YM", "MYM",
-    "CL", "MCL", "GC", "MGC", "SI", "SIL",
-    "BTC", "MBT", "ETH", "MET",
-})
-
-
-def _is_futures_symbol(symbol: str) -> bool:
-    """Return True if symbol is a futures contract (needs extended-hours data)."""
-    s = (symbol or "").strip().upper()
-    if s.startswith("/"):
-        return True
-    root = re.sub(r"[FGHJKMNQUVXZ]\d{1,2}$", "", s) or s
-    return root in _FUTURES_ROOTS
 
 
 @dataclass
@@ -180,15 +163,21 @@ class SchwabMarketDataProvider:
         frequency, frequency_type, period, period_type = spec
         params = {
             "symbol": symbol,
-            "periodType": period_type,
-            "period": period,
             "frequencyType": frequency_type,
             "frequency": frequency,
-            # Futures trade ~23h/day on Globex — include extended hours so VWAP,
-            # ATR, and channel calculations reflect the full overnight session.
-            "needExtendedHoursData": "true" if _is_futures_symbol(symbol) else "false",
+            "needExtendedHoursData": "false",
             "needPreviousClose": "false",
         }
+        if period_type == "day":
+            # Schwab's relative periodType=day window excludes the still-open
+            # current session entirely (it only rolls in after the day closes),
+            # so pass explicit bounds to force today's in-progress bars in.
+            now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+            params["startDate"] = now_ms - period * 24 * 60 * 60 * 1000
+            params["endDate"] = now_ms
+        else:
+            params["periodType"] = period_type
+            params["period"] = period
 
         r = self._request("GET", "/pricehistory", params=params)
         if r is None:
